@@ -78,7 +78,7 @@ from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 # ==========================================
 client = AsyncOpenAI(
     base_url="http://localhost:1234/v1", 
-    api_key="sk-lm-jWTBDz0M:qEZKEPaGwBDvh6kBhMaR"
+    api_key="your lm studio key "
 )
 
 BRAIN_MODEL = "qwen3-next-80b-a3b-instruct-decensored-i1" 

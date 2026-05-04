@@ -6,6 +6,7 @@ import time
 import re
 import json
 import hid
+import math
 from datetime import datetime
 import numpy as np
 import ctypes
@@ -62,7 +63,9 @@ aurelia_state = {
     "thermal_alert": "STABLE",    # Trips to CRITICAL_FEVER if temp limits exceeded
     
     # --- SPATIAL & BIOMETRICS ---
-    "vibration_xyz": [0.0, 0.0, 0.0],
+    "vibe_magnitude": 0.0,        # L2 Norm (Gravity Removed)
+    "vibe_jitter": 0.0,           # Option B: Variance (Standard Deviation)
+    "vibe_peak": 0.0,             # Instantaneous Peak - LATCHED
     "lidar_horizontal_m": 0.0,
     "last_lidar_time": time.time(), # Added for Timeout Logic
     "spatial_mmwave_mm": 0,  
@@ -78,12 +81,14 @@ aurelia_state = {
     "history_lidar": [],
     "history_pulse": [],
     "history_spatial": [],
-    "history_vibe": [],
+    "history_vibe_mag": [],       
+    "history_vibe_jitter": [],    
+    "history_vibe_peak": [],      # Tracks peak events for duration analysis
     "history_temp": [],
     "history_cpu_temp": [],
     "history_brain_temp": [],
     "history_eye_temp": [],
-    "history_bpm": []        # NEW: Added for Thalamic Volatility calculation
+    "history_bpm": []        
 }
 
 latest_frame = None
@@ -92,23 +97,48 @@ fast_pulse_buffer = deque(maxlen=200) # Thread-safe, auto-pruning buffer
 # ==========================================
 # ADVANCED DATA PROCESSING
 # ==========================================
-def extract_vitals_from_mmwave(amplitude_array, sample_rate_hz=10):
+def extract_vitals_from_mmwave(amplitude_array, sample_rate_hz=10, min_power_threshold=2.0):
+    # Wait for at least 5 seconds of data to establish a baseline
     if len(amplitude_array) < sample_rate_hz * 5: 
         return {"bpm": 0, "respiration": 0}
 
-    # FFT Hanning Windowing Integration
+    # --- THE MACRO-NOISE FILTER ---
+    std_dev = np.std(amplitude_array)
+    # Relaxed from 40mm to 100mm to allow for normal desk shifting
+    if std_dev > 100.0:
+        return {"bpm": 0, "respiration": 0}
+
+    # 1. Normalize and Hanning Window the real data
     data = np.array(amplitude_array) - np.mean(amplitude_array)
     windowed_data = data * np.hanning(len(data))
     
-    fft_vals = np.abs(np.fft.rfft(windowed_data))
-    freqs = np.fft.rfftfreq(len(windowed_data), d=1.0/sample_rate_hz)
+    # 2. ZERO-PADDING
+    pad_length = 1024 
     
+    # 3. Run FFT with the padded length
+    fft_vals = np.abs(np.fft.rfft(windowed_data, n=pad_length))
+    freqs = np.fft.rfftfreq(pad_length, d=1.0/sample_rate_hz)
+    
+    # 4. Extract Heart Rate (48 to 150 BPM)
     hr_mask = (freqs >= 0.8) & (freqs <= 2.5)
-    bpm = int(freqs[hr_mask][np.argmax(fft_vals[hr_mask])] * 60) if np.any(hr_mask) else 0
+    bpm = 0
+    if np.any(hr_mask):
+        hr_peak_power = np.max(fft_vals[hr_mask])
         
+        # UNCOMMENT THIS LINE TO WATCH THE FFT POWER IN REAL TIME:
+        # print(f"[Vitals Debug] StdDev: {std_dev:.2f}mm | HR Power: {hr_peak_power:.2f}")
+        
+        if hr_peak_power > min_power_threshold:
+            bpm = int(freqs[hr_mask][np.argmax(fft_vals[hr_mask])] * 60)
+            
+    # 5. Extract Respiration (12 to 30 Breaths/Min)
     resp_mask = (freqs >= 0.2) & (freqs <= 0.5)
-    respiration = int(freqs[resp_mask][np.argmax(fft_vals[resp_mask])] * 60) if np.any(resp_mask) else 0
-        
+    respiration = 0
+    if np.any(resp_mask):
+        resp_peak_power = np.max(fft_vals[resp_mask])
+        if resp_peak_power > min_power_threshold:
+            respiration = int(freqs[resp_mask][np.argmax(fft_vals[resp_mask])] * 60)
+            
     return {"bpm": bpm, "respiration": respiration}
 
 def calculate_confidence():
@@ -231,20 +261,45 @@ def system_health_thread():
 
 # --- VIBRATION THREAD (COM8) ---
 def vibe_thread():
+    """High-Frequency Reflex Loop: Unfolded L2 Norm, Jitter Calculation, and Signal Latch"""
+    vibe_buffer_raw = deque(maxlen=50) # ~0.5s window at 100Hz
     while True:
         ser = None
         try:
             ser = serial.Serial(VIBE_PORT, 115200, timeout=1)
             ser.reset_input_buffer()
             print(f"[{get_log_time()}] [OMNI-HUB: VIBE] INFO: Thread bound to {VIBE_PORT}")
+            
             while True:
                 raw = ser.readline().decode('utf-8', errors='ignore').strip()
                 if "," in raw:
                     parts = raw.split(',')
                     if len(parts) == 3:
-                        x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                        with state_lock:
-                            aurelia_state["vibration_xyz"] = [round(x,3), round(y,3), round(z,3)]
+                        try:
+                            # 1. Euclidean Norm (L2) Calculation on RAW wave
+                            x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
+                            mag = math.sqrt(x**2 + y**2 + z**2)
+                            vibe_buffer_raw.append(mag)
+                            
+                            # 2. Calculate Variance (Jitter) on unfolded data
+                            if len(vibe_buffer_raw) > 1:
+                                current_avg = np.mean(vibe_buffer_raw)
+                                current_jitter = np.std(vibe_buffer_raw)
+                                
+                                # Deviation from 1.0G for output/peak
+                                current_mag_deviation = abs(current_avg - 1.0)
+                                current_peak_deviation = max(abs(v - 1.0) for v in vibe_buffer_raw)
+                                
+                                with state_lock:
+                                    # Magnitude and Jitter are instantaneous (fluid)
+                                    aurelia_state["vibe_magnitude"] = round(float(current_mag_deviation), 4)
+                                    aurelia_state["vibe_jitter"] = round(float(current_jitter), 4)
+                                        
+                                    # LATCH: Only update peak if the new value is higher
+                                    if current_peak_deviation > aurelia_state["vibe_peak"]:
+                                        aurelia_state["vibe_peak"] = round(float(current_peak_deviation), 4)
+                        except ValueError:
+                            pass # Skip malformed float conversions
         except Exception as e: 
             print(f"[{get_log_time()}] [OMNI-HUB: VIBE] ERROR: Vibration sensor connection lost - {e}")
             if ser: ser.close()
@@ -341,7 +396,8 @@ def pulse_thread():
                                 distance_str = parts[1].split(" cm")[0]
                                 
                                 if sensor_type == "Detection Distance":
-                                    current_dist_mm = int(float(distance_str) * 10)
+                                    # Removed the int() cast to preserve sub-millimeter chest displacement
+                                    current_dist_mm = float(distance_str) * 10.0
                                     delta_mm = abs(current_dist_mm - last_detection_distance)
                                     
                                     with state_lock:
@@ -350,7 +406,6 @@ def pulse_thread():
                                         aurelia_state["pulse_present"] = (current_dist_mm > 0)
                                     
                                         fast_pulse_buffer.append(current_dist_mm)
-                                        # pop(0) removed; deque automatically prunes maxlen=200
                                     
                                     last_detection_distance = current_dist_mm
                         except Exception as parse_e:
@@ -399,12 +454,14 @@ def memory_buffer_thread():
         "lidar_horizontal_m": "history_lidar",
         "pulse_mmwave_mm": "history_pulse",
         "spatial_mmwave_mm": "history_spatial",
-        "vibration_xyz": "history_vibe",
+        "vibe_magnitude": "history_vibe_mag",       
+        "vibe_jitter": "history_vibe_jitter",       
+        "vibe_peak": "history_vibe_peak",           
         "temperature_c": "history_temp",
         "cpu_thermals": "history_cpu_temp",
         "brain_thermals_strix": "history_brain_temp",
         "eye_thermals_v620": "history_eye_temp",
-        "bpm": "history_bpm"  # NEW: Vital for the Thalamic Filter
+        "bpm": "history_bpm" 
     }
     
     while True:
@@ -412,20 +469,14 @@ def memory_buffer_thread():
             with state_lock:
                 for state_key, hist_key in history_map.items():
                     if state_key in aurelia_state and hist_key in aurelia_state:
-                        # FIX: If it's the vibration array, calculate magnitude first
-                        if state_key == "vibration_xyz":
-                            vibe = aurelia_state[state_key]
-                            val_to_append = round(sum(abs(v) for v in vibe), 3)
-                        else:
-                            val_to_append = aurelia_state[state_key]
-                            
+                        val_to_append = aurelia_state[state_key]
                         aurelia_state[hist_key].append(val_to_append)
-                        if len(aurelia_state[hist_key]) > 30: 
+                        if len(aurelia_state[hist_key]) > 60: 
                             aurelia_state[hist_key].pop(0)
-            time.sleep(1)
+            time.sleep(0.5) 
         except Exception as e:
             print(f"[{get_log_time()}] [OMNI-HUB: BUFFER] ERROR: Memory array aggregation failed - {e}")
-            time.sleep(1)
+            time.sleep(0.5) 
 
 # ==========================================
 # THE BRAIN STEM LOGIC
@@ -462,8 +513,11 @@ def take_snapshot():
         raw_resp = vitals["respiration"]
         aurelia_state["respiration"] = int(np.clip(raw_resp, 1, 40)) if raw_resp > 0 else 0
         
-        aurelia_state["user_present"] = bool(lidar_active or frozen_pulse_present)
-
+        # --- THE ANTI-GHOSTING BIOLOGICAL FIX ---
+        # Presence now requires either an instantaneous LiDAR tripwire OR biological proof.
+        has_vitals = (aurelia_state["bpm"] > 0) or (aurelia_state["respiration"] > 0)
+        aurelia_state["user_present"] = bool(lidar_active or has_vitals)
+        
         # True-Thermal Protocol: Floor at 0.0, NO UPPER CLAMPING.
         aurelia_state["cpu_thermals"] = float(max(0.0, aurelia_state["cpu_thermals"]))
         aurelia_state["brain_thermals_strix"] = float(max(0.0, aurelia_state["brain_thermals_strix"]))
@@ -478,7 +532,14 @@ def take_snapshot():
         
         # Safely pull a copy of the fully resolved state for serialization
         state_snapshot = aurelia_state.copy()
+        
+        # --- RESET LATCHES AFTER READING ---
+        # We clear the impact receptor so it can record the next 30-second window
+        aurelia_state["vibe_peak"] = 0.0
 
+    # ==========================================
+    # VISION BRACKETING LOGIC (START & END)
+    # ==========================================
     local_frame = None
     with vision_lock:
         if latest_frame is not None:
@@ -487,10 +548,19 @@ def take_snapshot():
     if local_frame is not None:
         try:
             small_frame = cv2.resize(local_frame, (512, 512))
-            cv2.imwrite(r"C:\Aurelia_Project\Aurelia_Sensors\Aurelia_Optic_Buffer.jpg", small_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            print(f"[{get_log_time()}] [OMNI-HUB: CORE] Vision saved: Aurelia_Optic_Buffer.jpg")
+            
+            start_path = r"C:\Aurelia_Project\Aurelia_Sensors\Aurelia_Optic_Buffer_Start.jpg"
+            end_path = r"C:\Aurelia_Project\Aurelia_Sensors\Aurelia_Optic_Buffer_End.jpg"
+            
+            # 1. Shift timeline: The 'End' frame of the last 30s cycle becomes the 'Start' of this one
+            if os.path.exists(end_path):
+                os.replace(end_path, start_path)
+                
+            # 2. Save current frame as the new 'End' for the active 30s cycle
+            cv2.imwrite(end_path, small_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            print(f"[{get_log_time()}] [OMNI-HUB: CORE] Vision Bracket saved: Start & End buffers updated.")
         except Exception as e:
-            print(f"[{get_log_time()}] [OMNI-HUB: CORE] ERROR: Failed to write Optic Buffer - {e}")
+            print(f"[{get_log_time()}] [OMNI-HUB: CORE] ERROR: Failed to write Optic Buffers - {e}")
     
     # ==========================================
     # THE THALAMIC FILTER (Symbolic Compression)
@@ -507,7 +577,26 @@ def take_snapshot():
         sigma = 0.0
 
     current_bpm = state_snapshot['bpm']
-    is_spike = current_bpm > 100 or bpm_volatility == "HIGH_JITTER"
+    
+    # --- VIBRATION DURATION ANALYSIS ---
+    peak_hist = state_snapshot.get('history_vibe_peak', [])
+    jitter_hist = state_snapshot.get('history_vibe_jitter', [])
+    
+    # Detects human contact at Jitter >= 0.005 or Peak >= 0.045
+    vibe_active_pts = sum(1 for i in range(min(len(peak_hist), len(jitter_hist))) if peak_hist[i] >= 0.045 or jitter_hist[i] >= 0.005)
+    
+    # Typing requires 6 seconds of interaction (12 data points at 0.5s polling)
+    if vibe_active_pts >= 12:
+        vibe_context = "SUSTAINED_ACTIVITY (Typing/Working)"
+    elif vibe_active_pts >= 2:
+        vibe_context = "BRIEF_MOVEMENT"
+    elif state_snapshot["vibe_peak"] > 0.15:
+        vibe_context = "SHARP_IMPACT (Desk Bump)"
+    else:
+        vibe_context = "STILL (Baseline)"
+    
+    # --- UPDATED INTERRUPT LOGIC ---
+    is_spike = current_bpm > 100 or bpm_volatility == "HIGH_JITTER" or state_snapshot["vibe_peak"] > 0.15
 
     # Evaluate Thermal Hierarchy
     hottest_sensor = "CPU"
@@ -522,7 +611,7 @@ def take_snapshot():
     thermal_str = f"{hottest_sensor} PEAKING at {peak_temp}C" if peak_temp > 75 else "NOMINAL"
 
     # Construct the compressed Vibe Vector
-    vibe_summary = f"[VIBE_VECTOR | BPM: {current_bpm} ({bpm_trend}, \u03c3:{bpm_volatility}) | PROXIMITY: {state_snapshot['lidar_horizontal_m']}m | THERMAL: {thermal_str}]"
+    vibe_summary = f"[VIBE_VECTOR | BPM: {current_bpm} ({bpm_trend}, \u03c3:{bpm_volatility}) | VIBE: {state_snapshot['vibe_magnitude']}G ({vibe_context}, Peak: {state_snapshot['vibe_peak']}) | PROXIMITY: {state_snapshot['lidar_horizontal_m']}m | THERMAL: {thermal_str}]"
     
     thalamic_payload = {
         "timestamp": state_snapshot["timestamp"],
@@ -554,8 +643,6 @@ def take_snapshot():
     except Exception as e:
         print(f"[{get_log_time()}] [OMNI-HUB: CORE] ERROR: Failed to write Telemetry files - {e}")
 
-    # --- MAGNITUDE DEBUG ---
-    vibe_mag = round(sum(abs(v) for v in state_snapshot['vibration_xyz']), 3)
 
     print(f"    - Time:           {current_time}")
     print(f"    - Confidence:     {state_snapshot['confidence']}")
@@ -564,13 +651,18 @@ def take_snapshot():
     print(f"    - Eyes (eGPU):    {state_snapshot['eye_thermals_v620']}°C")
     print(f"    - Thermal Status: {state_snapshot['thermal_alert']}")
     print(f"    - Temp (Rig Core): {state_snapshot['temperature_c']}°C")
-    print(f"    - Vibration:      Magnitude {vibe_mag} (Raw Vibe Array Deprecated in CLI)")
+    # Added Jitter and Peak back to the console printout for easy debugging
+    print(f"    - Vibration:      Mag {state_snapshot['vibe_magnitude']}G | Jitter {state_snapshot['vibe_jitter']} | Peak {state_snapshot['vibe_peak']} | {vibe_context}")
     print(f"    - Spatial (Room): Range {state_snapshot['spatial_mmwave_mm']}mm | Delta: {state_snapshot['spatial_delta_mm']}mm")
     print(f"    - LiDAR (Desk):   {state_snapshot['lidar_horizontal_m']}m")
     
     if state_snapshot["user_present"]:
         print(f"    - Desk Presence:  YES")
-        pulse_status = "Active" if state_snapshot["pulse_present"] else "Stationary"
+        
+        # Verify if radar is seeing a human or just a static reflection
+        has_vitals_snapshot = state_snapshot['bpm'] > 0 or state_snapshot['respiration'] > 0
+        pulse_status = "Bio-Active" if has_vitals_snapshot else "Static Reflection"
+        
         print(f"        -> mmWave Radar: {pulse_status} ({state_snapshot['pulse_mmwave_mm']}mm)")
         print(f"        -> Vitals (FFT): {state_snapshot['bpm']} BPM | {state_snapshot['respiration']} Breaths/Min")
         print(f"        -> Thalamic Vibe: {vibe_summary} | Interrupt: {is_spike}")

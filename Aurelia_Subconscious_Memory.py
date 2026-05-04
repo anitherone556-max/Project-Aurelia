@@ -116,7 +116,7 @@ class SubconsciousMemoryManager:
     def log_error(self, step: str, error_traceback: str) -> bool:
         """
         Logs a failed execution attempt.
-        Returns True if failure_count > 5 (indicating a Stalled Goal).
+        Returns True if failure_count > 12 (indicating a Stalled Goal).
         """
         self.failure_count += 1
         
@@ -125,14 +125,14 @@ class SubconsciousMemoryManager:
             "error": error_traceback[-1000:] # Keep only the last 1000 chars of traceback to save tokens
         }
         
-        if len(self.working_memory_scratchpad) >= 5:
+        if len(self.working_memory_scratchpad) >= 12:
             # Replace the oldest entry (FIFO simulation) to prevent infinite context growth
             self.working_memory_scratchpad.pop(0)
             
         self.working_memory_scratchpad.append(new_entry)
         logger.warning(f"Error logged to scratchpad for step: {step} (Failures: {self.failure_count})")
         
-        return self.failure_count > 5
+        return self.failure_count > 12
 
     def get_scratchpad_formatted(self) -> str:
         """Formats the working memory for injection during an Error Reflection loop."""

@@ -1,3 +1,4 @@
+<img width="3056" height="4096" alt="ai-artwork_24eb36ce-d66b-4949-aa9f-4b370ebfeaa4" src="https://github.com/user-attachments/assets/cc7ca259-a6b3-4aaa-8fd8-9533b1070ac2" />
 Project Aurelia is an Asynchronous Biomimetic Multi-Model Entity (ABMME) that functions as a distributed digital organism. Its features are divided across its cognitive core, sensory nervous system, and physical hardware layers.
 
 1. Multi-Lobe Cognitive Architecture

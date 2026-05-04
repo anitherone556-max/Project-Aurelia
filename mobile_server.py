@@ -38,7 +38,7 @@ app = FastAPI(title="Aurelia Mobile Portal")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://asher.tail3b3bf6.ts.net", "http://100.99.94.11:8080"],
+    allow_origins=[" your web http ", ""],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -303,8 +303,8 @@ if __name__ == "__main__":
     
     TAILSCALE_IP = "0.0.0.0" 
     
-    cert_path = BASE_DIR / "asher.tail3b3bf6.ts.net.crt"
-    key_path = BASE_DIR / "asher.tail3b3bf6.ts.net.key"
+    cert_path = BASE_DIR / ""
+    key_path = BASE_DIR / ""
     
     if cert_path.exists() and key_path.exists():
         uvicorn.run(
